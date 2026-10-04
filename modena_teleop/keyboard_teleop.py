@@ -4,24 +4,32 @@ import sys
 import select
 import tty
 import termios
+import time
 from modena_common.enums import JogType, JogIndex, JogDirection
-from modena_interfaces.msg import JogCmd
+from modena_interfaces.msg import JogCmd, JogStatus
 from modena_interfaces.msg import RobotState
+from mr3_mini_driver.comm import MoveResult
 
 
 class KeyboardTeleop(Node):
     def __init__(self):
         super().__init__("keyboard_teleop")
-
-        # Publishes current pressed key
-        self.jog_cmd_pub = self.create_publisher(JogCmd, "jog_cmd", 10)
-        
-        # Subscribes to receive robot states
-        self.robot_state_sub = self.create_subscription(RobotState, "robot_state", self.robot_state_callback, 10)
+      
+        self.jog_cmd_pub = self.create_publisher(JogCmd, "jog_cmd", 10)       
+        self.robot_state_sub = self.create_subscription(RobotState, "robot_state", self.robot_state_callback, 10)        
+        self.jog_status_sub = self.create_subscription(JogStatus, "jog_status", self.jog_status_callback, 10)
         
         # Current robot state
         self.joint_pos = None
-        self.tool_pose = None        
+        self.tool_pose = None
+        
+        # Time when jog start was reported (None if not pending)
+        self.jog_start_time = None        
+       
+        self.jog_status = "Ready"
+        
+         # "Jogging" is shown only after a short delay, so an immediate jog warning can replace it before it's displayed        
+        self.jog_status_delay = 0.12
 
         # Handle initial press delay
         self.total_iterations = 10
@@ -63,26 +71,27 @@ class KeyboardTeleop(Node):
         "========================================\n"
         "       MR-3 Mini Keyboard Teleop\n"
         "========================================\n\n"
-        f"Mode      : {self.jog_type_str}\n"
-        f"Jog speed : {self.jog_speed}%\n\n"
+        f"Mode     : {self.jog_type_str}\n"
+        f"Jog speed: {self.jog_speed}%\n"
+        f"Status   : {self.jog_status}\n\n"
         )
         
         if self.tool_pose is not None:
             output += (
                 "Tool pose:\n"
-                f"X : {self.tool_pose[0]:.2f} mm\n"
-                f"Y : {self.tool_pose[1]:.2f} mm\n"
-                f"Z : {self.tool_pose[2]:.2f} mm\n"
-                f"R : {self.tool_pose[3]:.2f}°\n\n"
+                f"X: {self.tool_pose[0]:.2f} mm\n"
+                f"Y: {self.tool_pose[1]:.2f} mm\n"
+                f"Z: {self.tool_pose[2]:.2f} mm\n"
+                f"R: {self.tool_pose[3]:.2f}°\n\n"
             )
         
         if self.joint_pos is not None:
             output += (
                 "Joint positions:\n"
-                f"J1 : {self.joint_pos[0]:.2f}°\n"
-                f"J2 : {self.joint_pos[1]:.2f}°\n"
-                f"J3 : {self.joint_pos[2]:.2f}°\n"
-                f"J4 : {self.joint_pos[3]:.2f}°\n\n"
+                f"J1: {self.joint_pos[0]:.2f}°\n"
+                f"J2: {self.joint_pos[1]:.2f}°\n"
+                f"J3: {self.joint_pos[2]:.2f}°\n"
+                f"J4: {self.joint_pos[3]:.2f}°\n\n"
             )
 
         output += ("Controls:\n"
@@ -249,7 +258,49 @@ class KeyboardTeleop(Node):
         self.last_key = key
         self.jog_cmd_pub.publish(msg)
         
+        # Update jog status to "Jogging" after a short delay if no warnings were reported
+        if self.jog_start_time is not None:
+            if time.monotonic() - self.jog_start_time >= self.jog_status_delay:
+                self.jog_start_time = None
+                self.jog_status = "Jogging"
+        
         self.update_display()      
+    
+    def jog_status_callback(self, msg):
+        if msg.code == 0:
+            self.jog_start_time = time.monotonic()
+            return
+
+        # Any other status cancels a pending "Jogging"
+        self.jog_start_time = None
+        
+        match msg.code:            
+            case MoveResult.MOVE_JOG_FINISHED:
+                self.jog_status = "Ready" 
+            case MoveResult.MOVE_J1_JOG_LIMIT_PROXIMITY:
+                self.jog_status = "Cannot jog - J1 limit is too close"
+            case MoveResult.MOVE_J2_JOG_LIMIT_PROXIMITY:
+                self.jog_status = "Cannot jog - J2 limit is too close"
+            case MoveResult.MOVE_J3_JOG_LIMIT_PROXIMITY:
+                self.jog_status = "Cannot jog - J3 limit is too close"
+            case MoveResult.MOVE_J4_JOG_LIMIT_PROXIMITY:
+                self.jog_status = "Cannot jog - J4 limit is too close"
+            case MoveResult.MOVE_MOTOR_3_JOG_LIMIT_PROXIMITY:
+                self.jog_status = "Cannot jog - Motor 3 joint limit is too close"
+            case MoveResult.MOVE_PASSIVE_JOINT_JOG_LIMIT_PROXIMITY:
+                self.jog_status = "Cannot jog - Passive joint limit is too close"
+            case MoveResult.MOVE_WORKSPACE_JOG_LIMIT_PROXIMITY:
+                self.jog_status = "Cannot jog - Workspace limit is too close"
+            case MoveResult.MOVE_JOG_SPEED_OUT_OF_RANGE:
+                self.jog_status = "Cannot jog - Requested jog speed is outside the valid range (1-100%)"
+            case MoveResult.MOVE_JOINT_JOG_VEL_LIMIT_EXCEEDED:
+                self.jog_status = "Cannot jog - Requested joint jog velocity exceeds the limit"
+            case MoveResult.MOVE_JOINT_JOG_ACC_LIMIT_EXCEEDED:
+                self.jog_status = "Cannot jog - Requested joint jog acceleration exceeds the limit"
+            case MoveResult.MOVE_LINEAR_JOG_VEL_LIMIT_EXCEEDED:
+                self.jog_status = "Cannot jog - Requested linear jog velocity exceeds the limit"
+            case MoveResult.MOVE_LINEAR_JOG_ACC_LIMIT_EXCEEDED:
+                self.jog_status = "Cannot jog - Requested linear jog acceleration exceeds the limit"
 
     def destroy_node(self):
         try:      
